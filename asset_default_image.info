@@ -1,0 +1,5 @@
+name = Asset default image
+description = Specific set of constraints related to the use of default image for asset entity reference fields.
+package = Asset
+core = 7.x
+dependencies[] = asset_image

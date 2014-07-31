@@ -1,0 +1,166 @@
+<?php
+
+/**
+ * @file
+ * Asset default image
+ *
+ * This module provides a specific set of constraints related to the use of
+ * default image for asset entity reference fields.
+ *
+ * Namely :
+ *  • Upon deletion of any image asset, make sure its previous references
+ *    are replaced by the default.
+ *  • Prevents the default visual from being deleted
+ *  • Defines a constant holding the asset ID of this default image.
+ *  • Supports multiple default images using commas as separator.
+ *
+ * Caveats : 
+ *  • Requires manual setup of the default value for every image assets
+ *    entity reference fields.
+ *  • Likely incompatible with this patch : https://www.drupal.org/node/1368386
+ *
+ * Possible evolutions :
+ *  • Set automatically the default value to all image assets entity reference fields at once
+ *  • Allow / disallow for a configurable set of fields and/or content types
+ */
+
+$path = drupal_get_path('module', 'asset_default_image');
+include $path . '/includes/dereference.inc';
+
+// ADIA stands for "asset default image aid"
+// NB: multiple default images can be set using commas
+define('ADIA', variable_get('asset_default_image_aid', 0));
+
+
+/**
+ * Implement hook_entity_delete()
+ */
+function asset_default_image_entity_delete($entity, $entity_type) {
+  // Only react to asset images
+  list($entity_id, $rid, $bundle_name) = entity_extract_ids($entity_type, $entity);
+  if ($entity_type == 'asset' && in_array($bundle_name,
+    variable_get('asset_default_image_atypes', array('image')))) {
+    
+    // If the entity being deleted is an asset image,
+    // this looks for any other entities where it was referenced (via entity reference field),
+    // and resets corresponding field instance to its default value.
+    // Relies on the configuration of the instance of the field itself.
+    // (meaning its current default value, as defined in its settings, will be restored)
+    
+    // Retrieve info for all entityreference fields.
+    $conditions = array('type' => 'entityreference');
+    $include_additional = array('include_inactive' => TRUE);
+    $fields = field_read_fields($conditions, $include_additional);
+    $references = array();
+    // Loop through the fields.
+    foreach ($fields as $field) {
+      // Determine the target type of the field.
+      $target_type = $field['settings']['target_type'];
+      //$cleanup_enabled = (isset($field['settings']['dereference_on_delete']) && $field['settings']['dereference_on_delete']);
+      // Check if cleanup is enabled and the field references the same type as the referenced entity.
+      //if ($cleanup_enabled && $target_type == $entity_type) {
+      if ($target_type == $entity_type) {
+        $query = new EntityFieldQuery();
+        // Select on the entity id in the target_id column.
+        $query->fieldCondition($field, 'target_id', $entity_id);
+        $results = $query->execute();
+        // Loop through the found entity types and ids.
+        foreach ($results as $referencing_type => $entities) {
+          if (!isset($references[$referencing_type]['ids'])) {
+            $references[$referencing_type]['ids'] = array();
+          }
+          $references[$referencing_type]['fields'][$field['field_name']] = $field['field_name'];
+          $references[$referencing_type]['ids'] += array_keys($entities);
+        }
+        // Mark the field values as deleted in the database. They will be properly deleted
+        // later for hooks to react and rules to process etc. But this will be fast and should
+        // prevent usage of the now invalid references.
+        if ($field['storage']['type'] == 'field_sql_storage') {
+          $table = _field_sql_storage_tablename($field);
+          db_update($table)
+            ->condition('entity_type', $entity_type)
+            //->condition('bundle', isset($entity->bundle) ? $entity->bundle : $entity_type)
+            ->condition('bundle', $bundle_name)
+            ->condition('entity_id', $entity_id)
+            ->fields(array('deleted' => 1))
+            ->execute();
+        }
+      }
+    }
+    
+    // Remove references from each entity type.
+    // Modif 2014/07/30 18:56:35 : or, sets back default value (if any)
+    // @see asset_default_image_dereference()
+    foreach ($references as $referencing_type => $data) {
+      asset_default_image_dereference($entity_id, $referencing_type, $data['ids'], $data['fields'], 40);
+    }
+  }
+}
+
+
+/**
+ * Implements hook_menu().
+ */
+function asset_default_image_menu() {
+  $items = array();
+
+  $items['admin/structure/assets/default-image'] = array(
+    'title' => t('Default image'),
+    'description' => t('Configures default asset for entity reference fields pointing to image assets.'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('asset_default_image_settings_form'),
+    'access arguments' => array('administer assets'),
+    'file' => 'asset_default_image.admin.inc',
+  );
+
+  return $items;
+}
+
+
+/**
+ * Implements hook_menu_alter().
+ */
+function asset_default_image_menu_alter(&$items) {
+  $items['admin/content/assets/manage/%entity_object/%']['access callback'] = '_adiamaco';
+}
+
+
+/**
+ * Custom entity deletion access callback
+ * (adiamaco stands for "asset default image  asset manage  access callback override")
+ */
+function _adiamaco($op, $entity_type, $entity = NULL, $account = NULL) {
+  if ($op == 'delete' && $entity_type == 'asset') {
+    $adias = _get_adia_arr();
+    foreach($adias as $adia) {
+      if ($entity->aid == $adia) {
+        drupal_set_message(t("Selected image asset is currently used as the default image,
+          and it is protected against deletion.
+          <br>If you must delete it, see structure > assets > default image configuration."), 'warning');
+        // If there's a destination, follow it immediately (instead of displaying "access denied" page)
+        if (!empty($_GET['destination'])) {
+          drupal_goto($_GET['destination']);
+        }
+        return false;
+      }
+    }
+  }
+  // Fallback to "normal" access check
+  return entity_access($op, $entity_type, $entity, $account);
+}
+
+
+/**
+ * Helper : handles multiple values (comma-separated)
+ * @return array
+ */
+function _get_adia_arr() {
+  $arr = explode(',', ADIA);
+  if (!empty($arr)) {
+    foreach($arr as $i => $p) {
+      $arr[$i] = trim($p);
+    }
+  }
+  return $arr;
+}
+
